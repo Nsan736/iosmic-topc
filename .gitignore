@@ -1,0 +1,6 @@
+ios/build/
+ios/Payload/
+ios/MicSender.xcodeproj/
+ios/*.ipa
+.DS_Store
+__pycache__/
