@@ -71,7 +71,7 @@ def resolve_device(name):
     raise SystemExit("出力デバイスが見つかりません: " + name)
 
 
-def receive_loop(sock, buffer, stats, expected_frames, stop_event):
+def receive_loop(sock, buffer, stats, expected_frames, stop_event, gain):
     while not stop_event.is_set():
         try:
             data, _ = sock.recvfrom(4096)
@@ -97,6 +97,9 @@ def receive_loop(sock, buffer, stats, expected_frames, stop_event):
         if block.shape[0] != expected_frames:
             continue
 
+        if gain != 1.0:
+            block = np.clip(block * gain, -32768, 32767).astype("<i2")
+
         try:
             buffer.put_nowait(block)
         except queue.Full:
@@ -121,6 +124,12 @@ def main():
         type=int,
         default=4,
         help="再生開始までに貯めるパケット数 (1 パケット = 10 ms)",
+    )
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=1.0,
+        help="再生前に掛ける倍率。2.0 で約 +6 dB。超えた分はクリップする",
     )
     parser.add_argument("--list-devices", action="store_true")
     args = parser.parse_args()
@@ -161,7 +170,7 @@ def main():
 
     receiver = threading.Thread(
         target=receive_loop,
-        args=(sock, buffer, stats, args.frames, stop_event),
+        args=(sock, buffer, stats, args.frames, stop_event, args.gain),
         daemon=True,
     )
     receiver.start()
@@ -181,6 +190,8 @@ def main():
     print("出力先  : {}".format(name))
     print("形式    : {} Hz / {} ch / int16 / {} サンプルブロック".format(
         args.samplerate, args.channels, args.frames))
+    if args.gain != 1.0:
+        print("ゲイン  : {:.2f} 倍".format(args.gain))
     print("Ctrl+C で終了")
 
     try:

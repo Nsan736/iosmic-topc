@@ -5,8 +5,20 @@ struct ContentView: View {
 
     @AppStorage("host") private var host: String = "192.168.1.10"
     @AppStorage("port") private var portText: String = "50005"
+    @AppStorage("gainDb") private var gainDb: Double = 6
+    @AppStorage("micProcessing") private var micProcessing: Bool = true
 
     private var port: UInt16? { UInt16(portText.trimmingCharacters(in: .whitespaces)) }
+
+    private var gainLabel: String {
+        let multiplier = pow(10, gainDb / 20)
+        return String(format: "%+.0f dB (%.1f 倍)", gainDb, multiplier)
+    }
+
+    private func applyInputSettings() {
+        streamer.gain = Float(pow(10, gainDb / 20))
+        streamer.useMicProcessing = micProcessing
+    }
 
     var body: some View {
         NavigationView {
@@ -28,6 +40,25 @@ struct ContentView: View {
                             .keyboardType(.numberPad)
                             .disabled(streamer.isActive)
                     }
+                }
+
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("ゲイン")
+                            Spacer()
+                            Text(gainLabel)
+                                .foregroundColor(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(value: $gainDb, in: -12...24, step: 1)
+                    }
+                    Toggle("マイク処理を使う", isOn: $micProcessing)
+                        .disabled(streamer.isActive)
+                } header: {
+                    Text("入力")
+                } footer: {
+                    Text("ゲインは送信中でもすぐ反映される。マイク処理は iOS の自動音量調整とノイズ抑制で、切ると加工のない音になるかわりにかなり小さくなる。切り替えは次に送信を開始したときに効く。")
                 }
 
                 Section("状態") {
@@ -74,6 +105,9 @@ struct ContentView: View {
             .navigationTitle("MicSender")
         }
         .navigationViewStyle(.stack)
+        .onAppear(perform: applyInputSettings)
+        .onChange(of: gainDb) { _ in applyInputSettings() }
+        .onChange(of: micProcessing) { _ in applyInputSettings() }
         .onChange(of: streamer.isActive) { active in
             UIApplication.shared.isIdleTimerDisabled = active
         }

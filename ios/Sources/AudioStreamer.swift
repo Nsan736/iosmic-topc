@@ -16,6 +16,20 @@ final class AudioStreamer: ObservableObject {
     @Published private(set) var packetsSent: UInt64 = 0
     @Published private(set) var bytesSent: UInt64 = 0
 
+    /// 送信直前に掛ける倍率。送信中でも即座に反映される。
+    @Published var gain: Float = 1.0 {
+        didSet {
+            let clamped = min(max(gain, 0.1), 16)
+            stateLock.lock()
+            gainValue = clamped
+            stateLock.unlock()
+        }
+    }
+
+    /// iOS 側のマイク処理 (自動ゲイン制御・ノイズ抑制) を使うかどうか。
+    /// 切ると生の音がそのまま出るぶん小さくなる。切り替えは次回の開始時に効く。
+    @Published var useMicProcessing: Bool = true
+
     var isActive: Bool {
         switch state {
         case .connecting, .streaming: return true
@@ -33,6 +47,7 @@ final class AudioStreamer: ObservableObject {
     private var pending = Data()
     private var sequence: UInt32 = 0
     private var tapInstalled = false
+    private var gainValue: Float = 1.0
 
     // MARK: - 開始 / 停止
 
@@ -150,9 +165,11 @@ final class AudioStreamer: ObservableObject {
 
     private func configureAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
+        // .default は iOS のマイク処理が効いて実用的な音量になる。
+        // .measurement は一切の加工がない代わりにかなり小さい。
         try session.setCategory(
             .playAndRecord,
-            mode: .measurement,
+            mode: useMicProcessing ? .default : .measurement,
             options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker]
         )
         try session.setPreferredSampleRate(AudioPacket.sampleRate)
@@ -179,6 +196,7 @@ final class AudioStreamer: ObservableObject {
         stateLock.lock()
         let converter = self.converter
         let outFormat = self.outputFormat
+        let gain = gainValue
         stateLock.unlock()
 
         guard let converter = converter, let outFormat = outFormat else { return }
@@ -201,8 +219,17 @@ final class AudioStreamer: ObservableObject {
         guard status != .error, out.frameLength > 0, let channel = out.int16ChannelData else { return }
 
         let sampleCount = Int(out.frameLength) * Int(AudioPacket.channels)
-        let samples = UnsafeBufferPointer(start: channel[0], count: sampleCount)
+        let pointer = channel[0]
 
+        if gain != 1.0 {
+            // 自前で作ったバッファなので、その場で書き換えてよい。
+            for i in 0..<sampleCount {
+                let amplified = Int32((Float(pointer[i]) * gain).rounded())
+                pointer[i] = Int16(clamping: amplified)
+            }
+        }
+
+        let samples = UnsafeBufferPointer(start: pointer, count: sampleCount)
         var peak: Int32 = 0
         for sample in samples {
             peak = max(peak, abs(Int32(sample)))
