@@ -18,6 +18,8 @@ import time
 import cv2
 import numpy as np
 
+from netinfo import print_addresses
+
 MAGIC = b"IVID"
 VERSION = 1
 HEADER_FORMAT = "<4sBBHHHII"
@@ -215,12 +217,19 @@ def main():
         target=accept_loop, args=(server, latest, stats, stop_event), daemon=True
     ).start()
 
-    print("待ち受け: {}:{} (TCP)".format(args.bind, args.port))
+    print_addresses()
+    print("待ち受け  : {}:{} (TCP)".format(args.bind, args.port))
     if camera is not None:
         print("仮想カメラ: {} ({}x{} @ {} fps)".format(camera.device, args.width, args.height, args.fps))
-    print("プレビュー: {}".format("なし" if args.no_preview else "あり (q か Esc で終了)"))
+    if args.no_preview:
+        print("プレビュー: なし")
+    elif camera is not None:
+        print("プレビュー: あり (ウィンドウを閉じても仮想カメラへの出力は続く。q か Esc で終了)")
+    else:
+        print("プレビュー: あり (ウィンドウを閉じるか q / Esc で終了)")
     print("Ctrl+C で終了")
 
+    preview = not args.no_preview
     last_sequence = 0
     window_shown = False
     report_at = time.monotonic() + 1.0
@@ -234,16 +243,21 @@ def main():
                 last_sequence = sequence
                 if camera is not None:
                     camera.send(fit_frame(frame, args.width, args.height))
-                if not args.no_preview:
+                if preview:
                     cv2.imshow(WINDOW_TITLE, frame)
                     window_shown = True
 
-            if not args.no_preview:
+            if preview:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
                 if window_shown and cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
-                    break
+                    if camera is None:
+                        break
+                    # 仮想カメラを使っているときは、プレビューだけ閉じて出力を続ける。
+                    preview = False
+                    cv2.destroyAllWindows()
+                    print("\nプレビューを閉じました。仮想カメラへの出力は続けます (Ctrl+C で終了)")
 
             now = time.monotonic()
             if now >= report_at:
@@ -268,8 +282,7 @@ def main():
         server.close()
         if camera is not None:
             camera.close()
-        if not args.no_preview:
-            cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

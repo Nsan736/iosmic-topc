@@ -140,6 +140,11 @@ struct ContentView: View {
                 }
 
                 StatusRow(color: cameraIndicatorColor, text: cameraStatusText)
+                if camera.state == .waitingForReceiver, let issue = camera.connectionIssue {
+                    Text(issue)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
                 ValueRow(title: "フレーム", value: cameraFrameText)
                 ValueRow(title: "送信量", value: megabytes(camera.bytesSent))
             }

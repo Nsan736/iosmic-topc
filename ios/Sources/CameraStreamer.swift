@@ -67,6 +67,8 @@ final class CameraStreamer: NSObject, ObservableObject {
     @Published private(set) var framesPerSecond: Double = 0
     @Published private(set) var frameSize: CGSize = .zero
     @Published private(set) var isInterrupted = false
+    /// PC に繋がらないときの直近の理由。繋がったら nil に戻る。
+    @Published private(set) var connectionIssue: String?
 
     /// 以下の設定は送信中に変えてもそのまま反映される。
     @Published var position: Position = .back {
@@ -119,6 +121,10 @@ final class CameraStreamer: NSObject, ObservableObject {
     private var port: UInt16 = 0
     private var fpsWindowStart = Date()
     private var fpsWindowFrames = 0
+    private var sendStartedAt: Date?
+    private var watchdog: DispatchSourceTimer?
+    /// 開始と停止のたびに進める。前の回に予約した再接続が新しい回に紛れ込まないようにする。
+    private var runToken = 0
 
     // videoQueue と他のキューで共有するので lock で守る
     private let lock = NSLock()
@@ -156,6 +162,11 @@ final class CameraStreamer: NSObject, ObservableObject {
             forName: NSNotification.Name("AVCaptureSessionRuntimeErrorNotification"), object: session, queue: .main
         ) { [weak self] _ in
             self?.restartSessionIfNeeded()
+        })
+        observers.append(center.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.reconnectNowIfWaiting()
         })
     }
 
@@ -201,8 +212,12 @@ final class CameraStreamer: NSObject, ObservableObject {
             if self.session.isRunning { self.session.stopRunning() }
         }
         netQueue.async {
+            self.runToken += 1
+            self.watchdog?.cancel()
+            self.watchdog = nil
             self.generation += 1
             self.connected = false
+            self.sendStartedAt = nil
             self.connection?.stateUpdateHandler = nil
             self.connection?.cancel()
             self.connection = nil
@@ -216,6 +231,7 @@ final class CameraStreamer: NSObject, ObservableObject {
         state = .idle
         framesPerSecond = 0
         isInterrupted = false
+        connectionIssue = nil
     }
 
     private func beginCapture(host: String, port: UInt16) {
@@ -250,6 +266,8 @@ final class CameraStreamer: NSObject, ObservableObject {
             self.port = port
             self.fpsWindowStart = Date()
             self.fpsWindowFrames = 0
+            self.runToken += 1
+            self.startWatchdog()
             self.connect()
         }
     }
@@ -362,6 +380,15 @@ final class CameraStreamer: NSObject, ObservableObject {
         return nil
     }
 
+    /// バックグラウンドから戻った直後は接続が壊れていることがあるので、待たずに作り直す。
+    private func reconnectNowIfWaiting() {
+        guard state == .waitingForReceiver else { return }
+        netQueue.async {
+            guard !self.connected else { return }
+            self.connect()
+        }
+    }
+
     private func restartSessionIfNeeded() {
         guard isActive else { return }
         sessionQueue.async {
@@ -443,19 +470,22 @@ final class CameraStreamer: NSObject, ObservableObject {
         )
         self.connection = connection
 
-        connection.stateUpdateHandler = { [weak self] newState in
+        connection.stateUpdateHandler = { [weak self, weak connection] newState in
             guard let self = self, self.generation == myGeneration else { return }
             switch newState {
             case .ready:
                 self.connected = true
+                self.sendStartedAt = nil
                 self.lock.lock()
                 self.readyToSend = self.running
                 self.lock.unlock()
                 DispatchQueue.main.async {
+                    self.connectionIssue = nil
                     if self.isActive { self.state = .streaming }
                 }
-            case .waiting(_), .failed(_):
-                self.dropConnectionAndRetry()
+            case .waiting(let error), .failed(let error):
+                let reason = Self.describe(error, path: connection?.currentPath)
+                self.dropConnectionAndRetry(reason: reason)
             default:
                 break
             }
@@ -464,7 +494,7 @@ final class CameraStreamer: NSObject, ObservableObject {
     }
 
     /// 受信側が落ちていても 1 秒ごとに繋ぎ直す。
-    private func dropConnectionAndRetry() {
+    private func dropConnectionAndRetry(reason: String) {
         lock.lock()
         readyToSend = false
         let shouldRun = running
@@ -472,27 +502,34 @@ final class CameraStreamer: NSObject, ObservableObject {
 
         generation += 1
         connected = false
+        sendStartedAt = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
 
         guard shouldRun else { return }
         DispatchQueue.main.async {
-            if self.isActive { self.state = .waitingForReceiver }
+            guard self.isActive else { return }
+            self.state = .waitingForReceiver
+            self.connectionIssue = reason
         }
+        let token = runToken
         netQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.connect()
+            guard let self = self, self.runToken == token else { return }
+            self.connect()
         }
     }
 
     private func send(_ packet: Data, width: Int, height: Int) {
         guard connected, let connection = connection else { return }
         let myGeneration = generation
+        sendStartedAt = Date()
 
         connection.send(content: packet, completion: .contentProcessed { [weak self] error in
             guard let self = self, self.generation == myGeneration else { return }
-            if error != nil {
-                self.dropConnectionAndRetry()
+            self.sendStartedAt = nil
+            if let error = error {
+                self.dropConnectionAndRetry(reason: Self.describe(error, path: nil))
                 return
             }
             self.lock.lock()
@@ -501,6 +538,51 @@ final class CameraStreamer: NSObject, ObservableObject {
             self.recordSent(bytes: packet.count, width: width, height: height)
         })
     }
+
+    /// Wi-Fi が一瞬切れると、TCP はエラーを返さないまま送信だけが止まることがある。
+    /// 1 フレームの送信が 5 秒終わらなければ、切れたとみなして繋ぎ直す。
+    private func startWatchdog() {
+        watchdog?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: netQueue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.connected,
+                  let startedAt = self.sendStartedAt,
+                  Date().timeIntervalSince(startedAt) > 5 else { return }
+            self.dropConnectionAndRetry(reason: "PC への送信が止まったため接続し直しています")
+        }
+        watchdog = timer
+        timer.resume()
+    }
+
+    private static func describe(_ error: NWError, path: NWPath?) -> String {
+        if #available(iOS 14.2, *), path?.unsatisfiedReason == .localNetworkDenied {
+            return localNetworkDeniedMessage
+        }
+        switch error {
+        case .posix(let code):
+            switch code {
+            case .ECONNREFUSED:
+                return "PC に届いたが拒否された。PC 側で video_receiver.py が起動しているか確認"
+            case .ETIMEDOUT:
+                return "PC から応答がない。IP アドレス、Wi-Fi、PC のファイアウォールを確認"
+            case .EHOSTUNREACH, .EHOSTDOWN, .ENETUNREACH, .ENETDOWN:
+                return "PC に到達できない。iPad と PC が同じ Wi-Fi に繋がっているか確認"
+            case .ECONNRESET, .EPIPE, .ECONNABORTED:
+                return "PC 側で接続が切られた。受信スクリプトが再起動されたかもしれない"
+            default:
+                return "接続エラー (POSIX \(code.rawValue))"
+            }
+        case .dns(let code) where Int(code) == -65570:
+            // kDNSServiceErr_PolicyDenied。ローカルネットワークの許可がないと返る。
+            return localNetworkDeniedMessage
+        default:
+            return "接続エラー: \(error.localizedDescription)"
+        }
+    }
+
+    private static let localNetworkDeniedMessage =
+        "ローカルネットワークへのアクセスが許可されていない。設定アプリ → プライバシーとセキュリティ → ローカルネットワークで LiveContainer を許可"
 
     private func markReadyIfConnected() {
         netQueue.async {

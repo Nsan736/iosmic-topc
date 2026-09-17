@@ -103,7 +103,7 @@ netsh advfirewall firewall add rule name="MicSender UDP 50005" dir=in action=all
 python windows/video_receiver.py
 ```
 
-プレビューウィンドウに iPad の映像が出る。`q` か `Esc` で終了。
+プレビューウィンドウに iPad の映像が出る。`q` か `Esc` で終了。起動時に表示される「PC の IP」を iPad のアプリに入力する。
 
 Web カメラとして使うには [OBS Studio](https://obsproject.com/) を入れ、一度 OBS で「仮想カメラ開始」を押して仮想カメラを登録しておく (登録後は OBS を閉じてよい)。そのうえで次のように起動する。
 
@@ -111,7 +111,7 @@ Web カメラとして使うには [OBS Studio](https://obsproject.com/) を入�
 python windows/video_receiver.py --virtualcam
 ```
 
-Zoom や Discord のカメラ選択で `OBS Virtual Camera` を選ぶ。iPad を縦にすると縦長の映像が届くが、仮想カメラには黒帯を付けて 1280x720 に収めて出す。
+Zoom や Discord のカメラ選択で `OBS Virtual Camera` を選ぶ。このときはプレビューウィンドウを閉じても仮想カメラへの出力は続く。iPad を縦にすると縦長の映像が届くが、仮想カメラには黒帯を付けて 1280x720 に収めて出す。
 
 TCP 50006 もファイアウォールで許可しておく。
 
@@ -182,7 +182,8 @@ LiveContainer で動かす場合はホストアプリの中で動くため、Alt
 | 音が割れる | ゲインを下げる。送信側でクリップすると PC 側では直せない |
 | 音がおかしい / ノイズだらけ | 送信側と `--frames` `--samplerate` `--channels` が揃っているか確認 |
 | `lost` が増え続ける | 電波状況の問題。ルーターとの距離、2.4 GHz の混雑を疑う |
-| 映像が「PC の受信待ち」のまま | `video_receiver.py` が起動しているか、TCP 50006 がファイアウォールで許可されているかを確認 |
+| 映像が「PC の受信待ち」のまま | その下に出る理由を見る。「拒否された」なら `video_receiver.py` が起動していない。「応答がない」なら IP・Wi-Fi・TCP 50006 のファイアウォール許可を確認 |
+| PC 側は正常なのに「PC の受信待ち」から進まない | iPad の Safari で `http://<PC の IP>:50006` を開いて受信側に `接続:` と出るなら経路は正常。LiveContainer をアプリスイッチャーから完全に終了して開き直す。ローカルネットワークの許可 (設定 → プライバシーとセキュリティ → ローカルネットワーク) も確認 |
 | 映像がカクつく | 解像度を 720p や 480p に下げるか、画質を下げる。アプリの fps 表示が 30 近く出ていれば送信側は間に合っている |
 | `--virtualcam` でエラーになる | OBS Studio を入れて一度「仮想カメラ開始」を押す |
 | カメラの許可ダイアログが出ない | LiveContainer ではホストアプリ側の権限として扱われる。iPad の設定アプリで LiveContainer のカメラを許可する |

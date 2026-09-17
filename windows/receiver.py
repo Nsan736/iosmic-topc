@@ -18,6 +18,8 @@ import time
 import numpy as np
 import sounddevice as sd
 
+from netinfo import print_addresses
+
 MAGIC = b"IMIC"
 VERSION = 1
 HEADER_FORMAT = "<4sBBHII"
@@ -186,6 +188,7 @@ def main():
     )
 
     name = sd.query_devices(device if device is not None else sd.default.device[1])["name"]
+    print_addresses()
     print("待ち受け: {}:{}".format(args.bind, args.port))
     print("出力先  : {}".format(name))
     print("形式    : {} Hz / {} ch / int16 / {} サンプルブロック".format(
