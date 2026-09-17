@@ -2,12 +2,14 @@ import SwiftUI
 
 @main
 struct MicSenderApp: App {
-    @StateObject private var streamer = AudioStreamer()
+    @StateObject private var audio = AudioStreamer()
+    @StateObject private var camera = CameraStreamer()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(streamer)
+                .environmentObject(audio)
+                .environmentObject(camera)
         }
     }
 }

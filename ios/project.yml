@@ -41,7 +41,8 @@ targets:
         UIBackgroundModes:
           - audio
         NSMicrophoneUsageDescription: マイク音声を Windows PC へ送信するために使用します。
-        NSLocalNetworkUsageDescription: 同一 LAN 上の Windows PC へ音声を送信するために使用します。
+        NSCameraUsageDescription: カメラ映像を Windows PC へ送信するために使用します。
+        NSLocalNetworkUsageDescription: 同一 LAN 上の Windows PC へ音声と映像を送信するために使用します。
         ITSAppUsesNonExemptEncryption: false
         UIRequiresFullScreen: false
         UISupportedInterfaceOrientations:
