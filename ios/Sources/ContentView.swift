@@ -140,13 +140,23 @@ struct ContentView: View {
                 }
 
                 StatusRow(color: cameraIndicatorColor, text: cameraStatusText)
-                if camera.state == .waitingForReceiver, let issue = camera.connectionIssue {
+                if camera.isInterrupted, let reason = camera.interruptionReason {
+                    Text(reason)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                } else if camera.state == .waitingForReceiver, let issue = camera.connectionIssue {
                     Text(issue)
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
                 ValueRow(title: "フレーム", value: cameraFrameText)
                 ValueRow(title: "送信量", value: megabytes(camera.bytesSent))
+
+                if camera.isActive {
+                    DisclosureGroup("詳細 (不具合調査用)") {
+                        CameraDiagnosticsView(diagnostics: camera.diagnostics)
+                    }
+                }
             }
         } header: {
             Text("カメラ")
@@ -229,6 +239,9 @@ struct ContentView: View {
         if camera.isInterrupted && camera.isActive {
             return "カメラが一時停止中"
         }
+        if cameraStalledWhileConnected {
+            return "接続中だが映像を送れていない"
+        }
         switch camera.state {
         case .idle: return "停止中"
         case .waitingForReceiver: return "PC の受信待ち..."
@@ -237,8 +250,15 @@ struct ContentView: View {
         }
     }
 
+    /// 接続は生きているのに 3 秒以上フレームを送れていない状態。緑のままだと気付けないので分けて出す。
+    private var cameraStalledWhileConnected: Bool {
+        guard camera.state == .streaming, let age = camera.diagnostics.sendAge else { return false }
+        return age > 3
+    }
+
     private var cameraIndicatorColor: Color {
         if camera.isInterrupted && camera.isActive { return .orange }
+        if cameraStalledWhileConnected { return .orange }
         switch camera.state {
         case .idle: return .gray
         case .waitingForReceiver: return .orange
@@ -282,6 +302,38 @@ private struct LabeledField: View {
                 .multilineTextAlignment(.trailing)
                 .keyboardType(keyboard)
         }
+    }
+}
+
+private struct CameraDiagnosticsView: View {
+    let diagnostics: CameraStreamer.Diagnostics
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ValueRow(title: "接続", value: diagnostics.connection)
+            ValueRow(title: "接続試行 / 切断", value: "\(diagnostics.attempts) 回 / \(diagnostics.reconnects) 回")
+            ValueRow(title: "最後のカメラフレーム", value: ago(diagnostics.frameAge))
+            ValueRow(title: "最後の送信完了", value: ago(diagnostics.sendAge))
+            ValueRow(title: "送信中のフレーム", value: diagnostics.sendInFlight.map { String(format: "%.1f 秒経過", $0) } ?? "なし")
+            ValueRow(title: "取りこぼし", value: dropText)
+            ValueRow(title: "カメラ再起動", value: "\(diagnostics.captureRestarts) 回")
+            ValueRow(title: "応答 session / video", value: "\(ago(diagnostics.sessionQueueLag)) / \(ago(diagnostics.videoQueueLag))")
+            ValueRow(title: "JPEG 変換中", value: diagnostics.encodeInFlight.map { String(format: "%.1f 秒経過", $0) } ?? "なし")
+            ValueRow(title: "変換器の作り直し", value: "\(diagnostics.encoderResets) 回")
+            ValueRow(title: "発熱 (システム負荷)", value: diagnostics.pressure)
+            ValueRow(title: "メモリ", value: String(format: "%.0f MB", diagnostics.memoryMB))
+        }
+        .font(.footnote)
+    }
+
+    private var dropText: String {
+        guard let reason = diagnostics.lastDropReason else { return "\(diagnostics.droppedFrames) 枚" }
+        return "\(diagnostics.droppedFrames) 枚 (\(reason))"
+    }
+
+    private func ago(_ seconds: Double?) -> String {
+        guard let seconds = seconds else { return "-" }
+        return String(format: "%.1f 秒前", seconds)
     }
 }
 

@@ -14,6 +14,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -62,6 +63,33 @@ class Stats:
         self.dropped = 0
         self.connections = 0
         self.size = None
+        # 受信処理がいま何をしているかと、最後にデータが届いた時刻。止まったときの切り分けに使う。
+        self.stage = None
+        self.last_data_at = None
+        self.handler_ident = None
+
+    def set_stage(self, stage, received_data=False):
+        with self.lock:
+            self.stage = stage
+            if received_data:
+                self.last_data_at = time.monotonic()
+
+    def begin_connection(self):
+        with self.lock:
+            self.stage = "ヘッダ待ち"
+            self.last_data_at = time.monotonic()
+            self.handler_ident = threading.get_ident()
+
+    def end_connection(self):
+        with self.lock:
+            if self.handler_ident == threading.get_ident():
+                self.stage = None
+                self.last_data_at = None
+                self.handler_ident = None
+
+    def activity(self):
+        with self.lock:
+            return self.stage, self.last_data_at, self.handler_ident
 
     def on_frame(self, nbytes, width, height):
         with self.lock:
@@ -82,7 +110,7 @@ class Stats:
             return self.frames, self.bytes, self.dropped, self.connections, self.size
 
 
-def recv_exact(conn, size):
+def recv_exact(conn, size, stats, stage):
     buffer = bytearray(size)
     view = memoryview(buffer)
     received = 0
@@ -91,30 +119,36 @@ def recv_exact(conn, size):
         if n == 0:
             raise ConnectionError("closed")
         received += n
+        stats.set_stage(stage, received_data=True)
     return buffer
 
 
 def handle_client(conn, address, latest, stats):
     print("\n接続: {}:{}".format(*address))
+    stats.begin_connection()
     try:
         while True:
-            header = recv_exact(conn, HEADER_SIZE)
+            stats.set_stage("ヘッダ待ち")
+            header = recv_exact(conn, HEADER_SIZE, stats, "ヘッダ待ち")
             magic, version, flags, width, height, _, length, _ = struct.unpack(HEADER_FORMAT, header)
             if magic != MAGIC or version != VERSION or length > MAX_FRAME_BYTES:
                 print("\n不正なヘッダを受信したので切断します")
                 break
 
-            payload = recv_exact(conn, length)
+            payload = recv_exact(conn, length, stats, "JPEG 本体待ち")
+            stats.set_stage("JPEG デコード中")
             frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 stats.on_drop()
                 continue
 
             stats.on_frame(length, frame.shape[1], frame.shape[0])
+            stats.set_stage("表示側へ受け渡し中")
             latest.put(frame, flags)
     except (ConnectionError, OSError):
         pass
     finally:
+        stats.end_connection()
         try:
             conn.close()
         except OSError:
@@ -148,6 +182,19 @@ def accept_loop(server, latest, stats, stop_event):
         threading.Thread(
             target=handle_client, args=(conn, address, latest, stats), daemon=True
         ).start()
+
+
+def report_stall(stats, seconds):
+    """データが途絶えたときに、受信処理がどこで止まっているかを表示する。"""
+    stage, _, ident = stats.activity()
+    print("\n[注意] iPad から {:.0f} 秒データが届いていません。受信処理の状態: {}".format(seconds, stage))
+    if stage in ("ヘッダ待ち", "JPEG 本体待ち"):
+        print("       PC はデータを待っているだけで正常です。iPad 側が送信を止めているか、Wi-Fi が途切れています。")
+    else:
+        print("       PC 側の処理が止まっています。以下を開発者に伝えてください。")
+        frame = sys._current_frames().get(ident)
+        if frame is not None:
+            print("".join(traceback.format_stack(frame)).rstrip())
 
 
 def fit_frame(frame, width, height):
@@ -223,13 +270,12 @@ def main():
         print("仮想カメラ: {} ({}x{} @ {} fps)".format(camera.device, args.width, args.height, args.fps))
     if args.no_preview:
         print("プレビュー: なし")
-    elif camera is not None:
-        print("プレビュー: あり (ウィンドウを閉じても仮想カメラへの出力は続く。q か Esc で終了)")
     else:
-        print("プレビュー: あり (ウィンドウを閉じるか q / Esc で終了)")
+        print("プレビュー: あり (ウィンドウを閉じても受信は続く。q / Esc か Ctrl+C で終了)")
     print("Ctrl+C で終了")
 
     preview = not args.no_preview
+    stall_reported = False
     last_sequence = 0
     window_shown = False
     report_at = time.monotonic() + 1.0
@@ -252,14 +298,21 @@ def main():
                 if key in (27, ord("q")):
                     break
                 if window_shown and cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
-                    if camera is None:
-                        break
-                    # 仮想カメラを使っているときは、プレビューだけ閉じて出力を続ける。
+                    # ここで終了すると iPad 側の接続が切れるので、プレビューだけ閉じて受信は続ける。
                     preview = False
                     cv2.destroyAllWindows()
-                    print("\nプレビューを閉じました。仮想カメラへの出力は続けます (Ctrl+C で終了)")
+                    print("\nプレビューを閉じました。受信は続けます (終了は Ctrl+C)")
 
             now = time.monotonic()
+            _, last_data_at, _ = stats.activity()
+            if last_data_at is not None and now - last_data_at > 5:
+                if not stall_reported:
+                    report_stall(stats, now - last_data_at)
+                    stall_reported = True
+            elif stall_reported:
+                print("\niPad からのデータが再開しました")
+                stall_reported = False
+
             if now >= report_at:
                 frames, total_bytes, dropped, connections, size = stats.snapshot()
                 fps = frames - last_frames

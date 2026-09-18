@@ -48,6 +48,11 @@ final class AudioStreamer: ObservableObject {
     private var sequence: UInt32 = 0
     private var tapInstalled = false
     private var gainValue: Float = 1.0
+    // 画面の更新は 1 秒に 20 回までにまとめる。毎回投げるとメインスレッドが追いつかなくなる。
+    private var unpublishedPackets: UInt64 = 0
+    private var unpublishedBytes: UInt64 = 0
+    private var unpublishedPeak: Float = 0
+    private var lastPublishedAt: TimeInterval = 0
 
     // MARK: - 開始 / 停止
 
@@ -263,13 +268,30 @@ final class AudioStreamer: ObservableObject {
             connection.send(content: packet, completion: .idempotent)
         }
 
-        let count = UInt64(packets.count)
+        let now = ProcessInfo.processInfo.systemUptime
+        stateLock.lock()
+        unpublishedPackets &+= UInt64(packets.count)
+        unpublishedBytes &+= bytes
+        unpublishedPeak = max(unpublishedPeak, peak)
+        let shouldPublish = now - lastPublishedAt >= 0.05
+        let count = unpublishedPackets
+        let totalBytes = unpublishedBytes
+        let heldPeak = unpublishedPeak
+        if shouldPublish {
+            unpublishedPackets = 0
+            unpublishedBytes = 0
+            unpublishedPeak = 0
+            lastPublishedAt = now
+        }
+        stateLock.unlock()
+
+        guard shouldPublish else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.packetsSent &+= count
-            self.bytesSent &+= bytes
+            self.bytesSent &+= totalBytes
             // 目視しやすいよう、下降だけ緩やかにする。
-            self.level = max(peak, self.level * 0.8)
+            self.level = max(heldPeak, self.level * 0.6)
         }
     }
 

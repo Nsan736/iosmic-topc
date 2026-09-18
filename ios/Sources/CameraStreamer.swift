@@ -8,6 +8,9 @@ import UIKit
 ///
 /// 前のフレームの送信が完了するまで次のフレームはエンコードせずに捨てるので、
 /// 回線が細くなってもフレームレートが落ちるだけで遅延は溜まらない。
+///
+/// 状態はすべて `lock` で守り、どのキューから触ってもよい。
+/// ただし NWConnection や AVCaptureSession の API は lock を持ったまま呼ばない。
 final class CameraStreamer: NSObject, ObservableObject {
     enum Position: String, CaseIterable, Identifiable {
         case front
@@ -61,14 +64,36 @@ final class CameraStreamer: NSObject, ObservableObject {
         case failed(String)
     }
 
+    /// 不具合調査用に画面へ出す内部状態。
+    struct Diagnostics: Equatable {
+        var connection = "-"
+        var attempts = 0
+        var frameAge: Double?
+        var sendAge: Double?
+        var sendInFlight: Double?
+        var droppedFrames = 0
+        var lastDropReason: String?
+        var captureRestarts = 0
+        var reconnects = 0
+        var sessionQueueLag: Double?
+        var videoQueueLag: Double?
+        var memoryMB: Double = 0
+        var pressure = "-"
+        var encodeInFlight: Double?
+        var encoderResets = 0
+    }
+
     @Published private(set) var state: State = .idle
     @Published private(set) var framesSent: UInt64 = 0
     @Published private(set) var bytesSent: UInt64 = 0
     @Published private(set) var framesPerSecond: Double = 0
     @Published private(set) var frameSize: CGSize = .zero
     @Published private(set) var isInterrupted = false
+    /// iOS がカメラを止めた理由。止まっていなければ nil。
+    @Published private(set) var interruptionReason: String?
     /// PC に繋がらないときの直近の理由。繋がったら nil に戻る。
     @Published private(set) var connectionIssue: String?
+    @Published private(set) var diagnostics = Diagnostics()
 
     /// 以下の設定は送信中に変えてもそのまま反映される。
     @Published var position: Position = .back {
@@ -104,40 +129,69 @@ final class CameraStreamer: NSObject, ObservableObject {
 
     private let sessionQueue = DispatchQueue(label: "com.example.micsender.camera.session")
     private let videoQueue = DispatchQueue(label: "com.example.micsender.camera.video", qos: .userInitiated)
-    private let netQueue = DispatchQueue(label: "com.example.micsender.camera.net")
+    private let controlQueue = DispatchQueue(label: "com.example.micsender.camera.control")
+    private let watchdogQueue = DispatchQueue(label: "com.example.micsender.camera.watchdog", qos: .utility)
     private let output = AVCaptureVideoDataOutput()
-    private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    // JPEG 変換はカメラの処理から切り離して専用のキューで行う。
+    // 変換が戻ってこなくなったら、監視がキューと CIContext ごと作り直す (lock で守る)。
+    private var ciContext = CameraStreamer.makeContext()
+    private var encodeQueue = CameraStreamer.makeEncodeQueue(generation: 0)
+    private var encoderGeneration = 0
+    private var encodeStartedAt: TimeInterval?
+    private var encoderResets = 0
 
     // sessionQueue 専用
     private var currentInput: AVCaptureDeviceInput?
     private var outputAdded = false
-
-    // netQueue 専用
-    private var connection: NWConnection?
-    private var connected = false
-    private var generation = 0
-    private var host = ""
-    private var port: UInt16 = 0
-    private var fpsWindowStart = Date()
-    private var fpsWindowFrames = 0
-    private var sendStartedAt: Date?
-    private var watchdog: DispatchSourceTimer?
-    /// 開始と停止のたびに進める。前の回に予約した再接続が新しい回に紛れ込まないようにする。
-    private var runToken = 0
-
-    // videoQueue と他のキューで共有するので lock で守る
-    private let lock = NSLock()
-    private var running = false
-    private var readyToSend = false
-    private var qualityValue: CGFloat = 0.6
-    private var flagsValue: UInt8 = 0
-    private var frameNumber: UInt32 = 0
+    private var pressureObservation: NSKeyValueObservation?
 
     // main 専用
     private var orientation: AVCaptureVideoOrientation = .portrait
     private var generatingOrientation = false
     private var observers: [NSObjectProtocol] = []
+    private var watchdog: DispatchSourceTimer?
+
+    // ここから下は lock で守る
+    private let lock = NSLock()
+    private var running = false
+    private var runToken = 0
+    private var host = ""
+    private var port: UInt16 = 0
+
+    private var connection: NWConnection?
+    /// 接続を作り直すたびに進める。古い接続からのコールバックを無視するのに使う。
+    private var connectionID = 0
+    private var connected = false
+    private var connectStartedAt: TimeInterval?
+    private var readyToSend = false
+    private var sendStartedAt: TimeInterval?
+    private var connectionText = "-"
+    private var attempts = 0
+    private var reconnects = 0
+
+    private var qualityValue: CGFloat = 0.6
+    private var flagsValue: UInt8 = 0
+    private var frameNumber: UInt32 = 0
+
+    private var totalFrames: UInt64 = 0
+    private var totalBytes: UInt64 = 0
+    private var lastFrameSize = CGSize.zero
+    private var lastDeliveredAt: TimeInterval = 0
+    private var lastSentAt: TimeInterval?
+    private var droppedFrames = 0
+    private var lastDropReason: String?
+    private var captureRestarts = 0
+    private var captureInterrupted = false
+    private var sessionHeartbeat: TimeInterval = 0
+    private var videoHeartbeat: TimeInterval = 0
+    private var fpsSampleFrames: UInt64 = 0
+    private var fpsSampleAt: TimeInterval = 0
+    private var pressureText = "-"
+    /// 発熱時に送るフレームの間隔を空けて、iOS にカメラを止められるのを防ぐ。
+    private var minFrameInterval: TimeInterval = 0
+    private var lastEncodeAt: TimeInterval = 0
 
     override init() {
         super.init()
@@ -150,18 +204,19 @@ final class CameraStreamer: NSObject, ObservableObject {
         })
         observers.append(center.addObserver(
             forName: NSNotification.Name("AVCaptureSessionWasInterruptedNotification"), object: session, queue: .main
-        ) { [weak self] _ in
-            self?.isInterrupted = true
+        ) { [weak self] notification in
+            let code = notification.userInfo?["AVCaptureSessionInterruptionReasonKey"] as? Int
+            self?.setInterrupted(true, reason: Self.describeInterruption(code))
         })
         observers.append(center.addObserver(
             forName: NSNotification.Name("AVCaptureSessionInterruptionEndedNotification"), object: session, queue: .main
         ) { [weak self] _ in
-            self?.isInterrupted = false
+            self?.setInterrupted(false, reason: nil)
         })
         observers.append(center.addObserver(
             forName: NSNotification.Name("AVCaptureSessionRuntimeErrorNotification"), object: session, queue: .main
         ) { [weak self] _ in
-            self?.restartSessionIfNeeded()
+            self?.restartCapture()
         })
         observers.append(center.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
@@ -174,6 +229,18 @@ final class CameraStreamer: NSObject, ObservableObject {
         for observer in observers {
             NotificationCenter.default.removeObserver(observer)
         }
+    }
+
+    private static func now() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime
+    }
+
+    private static func makeContext() -> CIContext {
+        CIContext(options: [.cacheIntermediates: false])
+    }
+
+    private static func makeEncodeQueue(generation: Int) -> DispatchQueue {
+        DispatchQueue(label: "com.example.micsender.camera.encode.\(generation)", qos: .userInitiated)
     }
 
     // MARK: - 開始 / 停止
@@ -191,6 +258,8 @@ final class CameraStreamer: NSObject, ObservableObject {
         bytesSent = 0
         framesPerSecond = 0
         frameSize = .zero
+        connectionIssue = nil
+        diagnostics = Diagnostics()
 
         requestPermission { [weak self] granted in
             guard let self = self, self.state == .waitingForReceiver else { return }
@@ -205,22 +274,25 @@ final class CameraStreamer: NSObject, ObservableObject {
     func stop() {
         lock.lock()
         running = false
+        runToken += 1
+        let oldConnection = connection
+        connection = nil
+        connectionID += 1
+        connected = false
         readyToSend = false
+        sendStartedAt = nil
+        connectStartedAt = nil
+        connectionText = "停止"
         lock.unlock()
+
+        oldConnection?.stateUpdateHandler = nil
+        oldConnection?.forceCancel()
+
+        watchdog?.cancel()
+        watchdog = nil
 
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
-        }
-        netQueue.async {
-            self.runToken += 1
-            self.watchdog?.cancel()
-            self.watchdog = nil
-            self.generation += 1
-            self.connected = false
-            self.sendStartedAt = nil
-            self.connection?.stateUpdateHandler = nil
-            self.connection?.cancel()
-            self.connection = nil
         }
 
         if generatingOrientation {
@@ -231,6 +303,7 @@ final class CameraStreamer: NSObject, ObservableObject {
         state = .idle
         framesPerSecond = 0
         isInterrupted = false
+        interruptionReason = nil
         connectionIssue = nil
     }
 
@@ -242,10 +315,30 @@ final class CameraStreamer: NSObject, ObservableObject {
         orientation = currentInterfaceOrientation() ?? orientation
         deviceOrientationChanged()
 
+        let now = Self.now()
         lock.lock()
         running = true
+        runToken += 1
+        self.host = host
+        self.port = port
         readyToSend = false
         frameNumber = 0
+        totalFrames = 0
+        totalBytes = 0
+        lastFrameSize = .zero
+        lastDeliveredAt = now
+        lastSentAt = nil
+        droppedFrames = 0
+        lastDropReason = nil
+        captureRestarts = 0
+        attempts = 0
+        reconnects = 0
+        sessionHeartbeat = now
+        videoHeartbeat = now
+        fpsSampleFrames = 0
+        fpsSampleAt = now
+        encodeStartedAt = nil
+        encoderResets = 0
         lock.unlock()
 
         let settings = currentSettings()
@@ -261,15 +354,8 @@ final class CameraStreamer: NSObject, ObservableObject {
             }
         }
 
-        netQueue.async {
-            self.host = host
-            self.port = port
-            self.fpsWindowStart = Date()
-            self.fpsWindowFrames = 0
-            self.runToken += 1
-            self.startWatchdog()
-            self.connect()
-        }
+        startWatchdog()
+        controlQueue.async { self.connect() }
     }
 
     // MARK: - キャプチャ構成
@@ -326,6 +412,10 @@ final class CameraStreamer: NSObject, ObservableObject {
             }
             session.addInput(input)
             currentInput = input
+
+            pressureObservation = device.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] device, _ in
+                self?.updatePressure(device.systemPressureState.level)
+            }
         }
 
         if !outputAdded {
@@ -380,19 +470,73 @@ final class CameraStreamer: NSObject, ObservableObject {
         return nil
     }
 
-    /// バックグラウンドから戻った直後は接続が壊れていることがあるので、待たずに作り直す。
-    private func reconnectNowIfWaiting() {
-        guard state == .waitingForReceiver else { return }
-        netQueue.async {
-            guard !self.connected else { return }
-            self.connect()
+    private static func describeInterruption(_ code: Int?) -> String {
+        // AVCaptureSession.InterruptionReason の値。
+        switch code {
+        case 1: return "アプリがバックグラウンドにあるため iOS がカメラを止めた"
+        case 2: return "マイクを他のアプリが使っているため iOS がカメラを止めた"
+        case 3: return "カメラを他のアプリが使っているため iOS がカメラを止めた"
+        case 4: return "複数のアプリが前面にあるため iOS がカメラを止めた"
+        case 5: return "発熱などでシステムの負荷が高いため iOS がカメラを止めた。しばらく冷ますか解像度を下げる"
+        case let code?: return "iOS がカメラを止めた (理由コード \(code))"
+        case nil: return "iOS がカメラを止めた (理由不明)"
         }
     }
 
-    private func restartSessionIfNeeded() {
-        guard isActive else { return }
+    private func setInterrupted(_ interrupted: Bool, reason: String?) {
+        isInterrupted = interrupted
+        interruptionReason = reason
+        lock.lock()
+        captureInterrupted = interrupted
+        // 中断が明けた直後にフレーム停止と誤判定しないよう、基準時刻を進める。
+        lastDeliveredAt = Self.now()
+        lock.unlock()
+    }
+
+    /// 発熱が進むと iOS はカメラを止める。その手前で送るフレームを減らして負荷を下げる。
+    private func updatePressure(_ level: AVCaptureDevice.SystemPressureState.Level) {
+        let text: String
+        let interval: TimeInterval
+        switch level {
+        case .nominal:
+            text = "正常"
+            interval = 0
+        case .fair:
+            text = "やや高い"
+            interval = 0
+        case .serious:
+            text = "高い (15 fps に制限中)"
+            interval = 1.0 / 15
+        case .critical:
+            text = "非常に高い (10 fps に制限中)"
+            interval = 1.0 / 10
+        case .shutdown:
+            text = "限界 (iOS がカメラを止める)"
+            interval = 1.0 / 10
+        default:
+            text = level.rawValue
+            interval = 0
+        }
+        lock.lock()
+        pressureText = text
+        minFrameInterval = interval
+        lock.unlock()
+    }
+
+    /// フレームが届かなくなったときや実行時エラーのときに、キャプチャを止めて起動し直す。
+    private func restartCapture() {
+        lock.lock()
+        let shouldRun = running
+        if shouldRun {
+            captureRestarts += 1
+            lastDeliveredAt = Self.now()
+        }
+        lock.unlock()
+        guard shouldRun else { return }
+
         sessionQueue.async {
-            if !self.session.isRunning { self.session.startRunning() }
+            if self.session.isRunning { self.session.stopRunning() }
+            self.session.startRunning()
         }
     }
 
@@ -445,67 +589,120 @@ final class CameraStreamer: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - ネットワーク (netQueue)
+    // MARK: - ネットワーク
 
     private func connect() {
-        lock.lock()
-        let shouldRun = running
-        lock.unlock()
-        guard shouldRun, let nwPort = NWEndpoint.Port(rawValue: port) else { return }
-
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
-        connected = false
-
-        generation += 1
-        let myGeneration = generation
-
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
-        tcp.connectionTimeout = 3
-        let connection = NWConnection(
+        tcp.connectionTimeout = 4
+        // PC 側が黙って消えたときにも数秒で気付けるようにする。
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 2
+        tcp.keepaliveInterval = 1
+        tcp.keepaliveCount = 3
+
+        lock.lock()
+        guard running, let nwPort = NWEndpoint.Port(rawValue: port) else {
+            lock.unlock()
+            return
+        }
+        let newConnection = NWConnection(
             host: NWEndpoint.Host(host),
             port: nwPort,
             using: NWParameters(tls: nil, tcp: tcp)
         )
-        self.connection = connection
+        let oldConnection = connection
+        connectionID += 1
+        let id = connectionID
+        connection = newConnection
+        connected = false
+        readyToSend = false
+        sendStartedAt = nil
+        connectStartedAt = Self.now()
+        attempts += 1
+        connectionText = "接続中 (\(attempts) 回目)"
+        lock.unlock()
 
-        connection.stateUpdateHandler = { [weak self, weak connection] newState in
-            guard let self = self, self.generation == myGeneration else { return }
+        oldConnection?.stateUpdateHandler = nil
+        oldConnection?.forceCancel()
+
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] newState in
+            guard let self = self else { return }
             switch newState {
             case .ready:
-                self.connected = true
-                self.sendStartedAt = nil
                 self.lock.lock()
+                guard self.connectionID == id else {
+                    self.lock.unlock()
+                    return
+                }
+                self.connected = true
                 self.readyToSend = self.running
+                self.connectStartedAt = nil
+                self.connectionText = "接続済み"
                 self.lock.unlock()
+
                 DispatchQueue.main.async {
                     self.connectionIssue = nil
                     if self.isActive { self.state = .streaming }
                 }
+                if let newConnection = newConnection {
+                    self.watchForClose(newConnection, id: id)
+                }
             case .waiting(let error), .failed(let error):
-                let reason = Self.describe(error, path: connection?.currentPath)
-                self.dropConnectionAndRetry(reason: reason)
+                let reason = Self.describe(error, path: newConnection?.currentPath)
+                self.drop(id: id, reason: reason)
+            case .preparing:
+                self.setConnectionText("接続処理中", id: id)
             default:
                 break
             }
         }
-        connection.start(queue: netQueue)
+        // 接続ごとに専用のキューを使い、前の接続の後始末が新しい接続を妨げないようにする。
+        newConnection.start(queue: DispatchQueue(label: "com.example.micsender.camera.connection.\(id)"))
     }
 
-    /// 受信側が落ちていても 1 秒ごとに繋ぎ直す。
-    private func dropConnectionAndRetry(reason: String) {
+    private func setConnectionText(_ text: String, id: Int) {
         lock.lock()
+        if connectionID == id { connectionText = text }
+        lock.unlock()
+    }
+
+    /// PC からデータは来ないが、受信待ちにしておくと PC 側が閉じたことにすぐ気付ける。
+    private func watchForClose(_ connection: NWConnection, id: Int) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self, weak connection] _, _, isComplete, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.drop(id: id, reason: Self.describe(error, path: nil))
+            } else if isComplete {
+                self.drop(id: id, reason: "PC 側で接続が閉じられた。受信スクリプトが終了したかもしれない")
+            } else if let connection = connection {
+                self.watchForClose(connection, id: id)
+            }
+        }
+    }
+
+    /// 接続を捨て、動作中なら 1 秒後に繋ぎ直す。
+    private func drop(id: Int, reason: String) {
+        lock.lock()
+        guard connectionID == id else {
+            lock.unlock()
+            return
+        }
+        let oldConnection = connection
+        connection = nil
+        connectionID += 1
+        connected = false
         readyToSend = false
+        sendStartedAt = nil
+        connectStartedAt = nil
+        connectionText = "再接続待ち"
+        reconnects += 1
         let shouldRun = running
+        let token = runToken
         lock.unlock()
 
-        generation += 1
-        connected = false
-        sendStartedAt = nil
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
-        connection = nil
+        oldConnection?.stateUpdateHandler = nil
+        oldConnection?.forceCancel()
 
         guard shouldRun else { return }
         DispatchQueue.main.async {
@@ -513,46 +710,177 @@ final class CameraStreamer: NSObject, ObservableObject {
             self.state = .waitingForReceiver
             self.connectionIssue = reason
         }
-        let token = runToken
-        netQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
-            guard let self = self, self.runToken == token else { return }
-            self.connect()
+        controlQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let stillWanted = self.running && self.runToken == token && self.connection == nil
+            self.lock.unlock()
+            if stillWanted { self.connect() }
+        }
+    }
+
+    /// バックグラウンドから戻った直後は接続が壊れていることがあるので、待たずに作り直す。
+    private func reconnectNowIfWaiting() {
+        guard state == .waitingForReceiver else { return }
+        controlQueue.async {
+            self.lock.lock()
+            let needed = self.running && !self.connected
+            self.lock.unlock()
+            if needed { self.connect() }
         }
     }
 
     private func send(_ packet: Data, width: Int, height: Int) {
-        guard connected, let connection = connection else { return }
-        let myGeneration = generation
-        sendStartedAt = Date()
+        lock.lock()
+        guard connected, let connection = connection else {
+            // 接続し直したときに .ready で送信可能に戻る。
+            lock.unlock()
+            return
+        }
+        let id = connectionID
+        sendStartedAt = Self.now()
+        lock.unlock()
 
+        let size = packet.count
         connection.send(content: packet, completion: .contentProcessed { [weak self] error in
-            guard let self = self, self.generation == myGeneration else { return }
-            self.sendStartedAt = nil
+            guard let self = self else { return }
             if let error = error {
-                self.dropConnectionAndRetry(reason: Self.describe(error, path: nil))
+                self.drop(id: id, reason: Self.describe(error, path: nil))
                 return
             }
             self.lock.lock()
-            self.readyToSend = self.running
+            if self.connectionID == id {
+                self.sendStartedAt = nil
+                self.readyToSend = self.running
+                self.totalFrames &+= 1
+                self.totalBytes &+= UInt64(size)
+                self.lastFrameSize = CGSize(width: width, height: height)
+                self.lastSentAt = Self.now()
+            }
             self.lock.unlock()
-            self.recordSent(bytes: packet.count, width: width, height: height)
         })
     }
 
-    /// Wi-Fi が一瞬切れると、TCP はエラーを返さないまま送信だけが止まることがある。
-    /// 1 フレームの送信が 5 秒終わらなければ、切れたとみなして繋ぎ直す。
+    private func markReadyIfConnected() {
+        lock.lock()
+        if connected { readyToSend = running }
+        lock.unlock()
+    }
+
+    // MARK: - 監視
+
+    /// 1 秒ごとに、止まっている箇所がないかを調べて自動で立て直し、画面用の数値をまとめて出す。
     private func startWatchdog() {
         watchdog?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: netQueue)
+        let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
-            guard let self = self, self.connected,
-                  let startedAt = self.sendStartedAt,
-                  Date().timeIntervalSince(startedAt) > 5 else { return }
-            self.dropConnectionAndRetry(reason: "PC への送信が止まったため接続し直しています")
+            self?.watchdogTick()
         }
         watchdog = timer
         timer.resume()
+    }
+
+    private func watchdogTick() {
+        let now = Self.now()
+
+        // 各キューが応答しているかを測る。固まっていれば値が伸び続ける。
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            self.sessionHeartbeat = Self.now()
+            self.lock.unlock()
+        }
+        videoQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            self.videoHeartbeat = Self.now()
+            self.lock.unlock()
+        }
+
+        lock.lock()
+        guard running else {
+            lock.unlock()
+            return
+        }
+
+        var stalledConnection: (id: Int, reason: String)?
+        if connection != nil, !connected, let startedAt = connectStartedAt, now - startedAt > 6 {
+            stalledConnection = (connectionID, "PC への接続が 6 秒たっても終わらないため接続し直しています")
+        } else if connected, let startedAt = sendStartedAt, now - startedAt > 5 {
+            stalledConnection = (connectionID, "PC への送信が 5 秒止まったため接続し直しています")
+        }
+
+        let captureStalled = !captureInterrupted && now - lastDeliveredAt > 4
+
+        // JPEG 変換が 3 秒戻らなければ、キューと CIContext を新しくして次のフレームから再開する。
+        if let startedAt = encodeStartedAt, now - startedAt > 3 {
+            encoderGeneration += 1
+            encodeQueue = Self.makeEncodeQueue(generation: encoderGeneration)
+            ciContext = Self.makeContext()
+            encodeStartedAt = nil
+            encoderResets += 1
+            if connected { readyToSend = true }
+        }
+
+        var fps: Double?
+        if now - fpsSampleAt >= 1 {
+            fps = Double(totalFrames - fpsSampleFrames) / (now - fpsSampleAt)
+            fpsSampleFrames = totalFrames
+            fpsSampleAt = now
+        }
+
+        let snapshot = Diagnostics(
+            connection: connectionText,
+            attempts: attempts,
+            frameAge: now - lastDeliveredAt,
+            sendAge: lastSentAt.map { now - $0 },
+            sendInFlight: sendStartedAt.map { now - $0 },
+            droppedFrames: droppedFrames,
+            lastDropReason: lastDropReason,
+            captureRestarts: captureRestarts,
+            reconnects: reconnects,
+            sessionQueueLag: now - sessionHeartbeat,
+            videoQueueLag: now - videoHeartbeat,
+            memoryMB: Self.memoryFootprintMB(),
+            pressure: pressureText,
+            encodeInFlight: encodeStartedAt.map { now - $0 },
+            encoderResets: encoderResets
+        )
+        let frames = totalFrames
+        let bytes = totalBytes
+        let size = lastFrameSize
+        lock.unlock()
+
+        if let stalled = stalledConnection {
+            drop(id: stalled.id, reason: stalled.reason)
+        }
+        if captureStalled {
+            restartCapture()
+        }
+
+        DispatchQueue.main.async {
+            guard self.isActive else { return }
+            self.framesSent = frames
+            self.bytesSent = bytes
+            if self.frameSize != size { self.frameSize = size }
+            if let fps = fps { self.framesPerSecond = fps }
+            if self.diagnostics != snapshot { self.diagnostics = snapshot }
+        }
+    }
+
+    private static func memoryFootprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / 1_048_576
     }
 
     private static func describe(_ error: NWError, path: NWPath?) -> String {
@@ -570,6 +898,8 @@ final class CameraStreamer: NSObject, ObservableObject {
                 return "PC に到達できない。iPad と PC が同じ Wi-Fi に繋がっているか確認"
             case .ECONNRESET, .EPIPE, .ECONNABORTED:
                 return "PC 側で接続が切られた。受信スクリプトが再起動されたかもしれない"
+            case .ECANCELED:
+                return "接続を作り直しています"
             default:
                 return "接続エラー (POSIX \(code.rawValue))"
             }
@@ -583,35 +913,6 @@ final class CameraStreamer: NSObject, ObservableObject {
 
     private static let localNetworkDeniedMessage =
         "ローカルネットワークへのアクセスが許可されていない。設定アプリ → プライバシーとセキュリティ → ローカルネットワークで LiveContainer を許可"
-
-    private func markReadyIfConnected() {
-        netQueue.async {
-            guard self.connected else { return }
-            self.lock.lock()
-            self.readyToSend = self.running
-            self.lock.unlock()
-        }
-    }
-
-    private func recordSent(bytes: Int, width: Int, height: Int) {
-        fpsWindowFrames += 1
-        let now = Date()
-        let elapsed = now.timeIntervalSince(fpsWindowStart)
-        var fps: Double?
-        if elapsed >= 1 {
-            fps = Double(fpsWindowFrames) / elapsed
-            fpsWindowFrames = 0
-            fpsWindowStart = now
-        }
-
-        let size = CGSize(width: width, height: height)
-        DispatchQueue.main.async {
-            self.framesSent &+= 1
-            self.bytesSent &+= UInt64(bytes)
-            if self.frameSize != size { self.frameSize = size }
-            if let fps = fps { self.framesPerSecond = fps }
-        }
-    }
 
     enum CameraError: LocalizedError {
         case deviceUnavailable
@@ -632,40 +933,79 @@ extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        let now = Self.now()
         lock.lock()
-        let shouldSend = running && readyToSend
+        lastDeliveredAt = now
+        var shouldSend = running && connected && readyToSend
+        if shouldSend, minFrameInterval > 0, now - lastEncodeAt < minFrameInterval {
+            shouldSend = false
+        }
         if shouldSend {
             readyToSend = false
             frameNumber &+= 1
+            lastEncodeAt = now
+            encodeStartedAt = now
         }
         let quality = qualityValue
         let flags = flagsValue
         let number = frameNumber
+        let queue = encodeQueue
+        let context = ciContext
+        let generation = encoderGeneration
         lock.unlock()
 
         guard shouldSend else { return }
-
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            markReadyIfConnected()
+            finishEncode(generation: generation, packet: nil, width: 0, height: 0)
             return
         }
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
-        let options: [CIImageRepresentationOption: Any] = [
-            CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality
-        ]
-        guard let jpeg = ciContext.jpegRepresentation(of: image, colorSpace: colorSpace, options: options) else {
-            markReadyIfConnected()
-            return
+        // カメラの処理はここで返し、変換は専用キューに任せる。
+        // 変換が固まってもカメラは止まらず、監視が変換器を作り直せる。
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            // 1 フレームごとに一時オブジェクトを確実に解放する。
+            autoreleasepool {
+                let width = CVPixelBufferGetWidth(pixelBuffer)
+                let height = CVPixelBufferGetHeight(pixelBuffer)
+                let image = CIImage(cvPixelBuffer: pixelBuffer)
+                let options: [CIImageRepresentationOption: Any] = [
+                    CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality
+                ]
+                let packet = context.jpegRepresentation(of: image, colorSpace: self.colorSpace, options: options)
+                    .map { VideoPacket.make(jpeg: $0, width: width, height: height, frameNumber: number, flags: flags) }
+                self.finishEncode(generation: generation, packet: packet, width: width, height: height)
+            }
         }
+    }
 
-        let packet = VideoPacket.make(
-            jpeg: jpeg, width: width, height: height, frameNumber: number, flags: flags
-        )
-        netQueue.async {
-            self.send(packet, width: width, height: height)
+    private func finishEncode(generation: Int, packet: Data?, width: Int, height: Int) {
+        lock.lock()
+        // 監視が変換器を作り直した後に古い変換が戻ってきた場合は捨てる。
+        let current = generation == encoderGeneration
+        if current { encodeStartedAt = nil }
+        lock.unlock()
+        guard current else { return }
+
+        if let packet = packet {
+            send(packet, width: width, height: height)
+        } else {
+            markReadyIfConnected()
         }
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didDrop sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        let reason = CMGetAttachment(
+            sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil
+        ) as? String
+
+        lock.lock()
+        droppedFrames += 1
+        if let reason = reason { lastDropReason = reason }
+        lock.unlock()
     }
 }
