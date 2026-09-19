@@ -81,6 +81,7 @@ final class CameraStreamer: NSObject, ObservableObject {
         var pressure = "-"
         var encodeInFlight: Double?
         var encoderResets = 0
+        var route = "-"
     }
 
     @Published private(set) var state: State = .idle
@@ -170,6 +171,7 @@ final class CameraStreamer: NSObject, ObservableObject {
     private var connectionText = "-"
     private var attempts = 0
     private var reconnects = 0
+    private var routeText = "-"
 
     private var qualityValue: CGFloat = 0.6
     private var flagsValue: UInt8 = 0
@@ -609,7 +611,7 @@ final class CameraStreamer: NSObject, ObservableObject {
         let newConnection = NWConnection(
             host: NWEndpoint.Host(host),
             port: nwPort,
-            using: NWParameters(tls: nil, tcp: tcp)
+            using: Self.lanParameters(tcp: tcp)
         )
         let oldConnection = connection
         connectionID += 1
@@ -626,8 +628,17 @@ final class CameraStreamer: NSObject, ObservableObject {
         oldConnection?.stateUpdateHandler = nil
         oldConnection?.forceCancel()
 
+        newConnection.pathUpdateHandler = { [weak self] path in
+            self?.setRoute(Self.describePath(path), id: id)
+        }
+        newConnection.betterPathUpdateHandler = { [weak self] available in
+            // Wi-Fi の繋ぎ直しなどで今の経路より良いものが出てきたら、古い経路に固執せず作り直す。
+            guard available else { return }
+            self?.drop(id: id, reason: "Wi-Fi の経路が変わったため接続し直しています")
+        }
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] newState in
             guard let self = self else { return }
+            self.setRoute(Self.describePath(newConnection?.currentPath), id: id)
             switch newState {
             case .ready:
                 self.lock.lock()
@@ -665,6 +676,45 @@ final class CameraStreamer: NSObject, ObservableObject {
         lock.lock()
         if connectionID == id { connectionText = text }
         lock.unlock()
+    }
+
+    private func setRoute(_ text: String, id: Int) {
+        lock.lock()
+        if connectionID == id { routeText = text }
+        lock.unlock()
+    }
+
+    /// LAN の PC に繋ぐための設定。Wi-Fi が一瞬切れた間にモバイル通信や VPN のトンネル
+    /// (StikDebug の VPN など) へ接続が割り当てられると、PC に届かないまま戻らなくなるので使わせない。
+    static func lanParameters(tcp: NWProtocolTCP.Options) -> NWParameters {
+        let parameters = NWParameters(tls: nil, tcp: tcp)
+        parameters.prohibitedInterfaceTypes = [.cellular, .other]
+        return parameters
+    }
+
+    static func describePath(_ path: NWPath?) -> String {
+        guard let path = path else { return "-" }
+        let interface = path.availableInterfaces.first.map { "\($0.name) (\(interfaceTypeName($0.type)))" } ?? "使える経路なし"
+        let local = path.localEndpoint.map { "\($0)" } ?? "未割り当て"
+        let status: String
+        switch path.status {
+        case .satisfied: status = "使用可"
+        case .unsatisfied: status = "使用不可"
+        case .requiresConnection: status = "接続待ち"
+        @unknown default: status = "不明"
+        }
+        return "\(interface) / 送信元 \(local) / \(status)"
+    }
+
+    private static func interfaceTypeName(_ type: NWInterface.InterfaceType) -> String {
+        switch type {
+        case .wifi: return "Wi-Fi"
+        case .cellular: return "モバイル通信"
+        case .wiredEthernet: return "有線"
+        case .loopback: return "ループバック"
+        case .other: return "VPN など"
+        @unknown default: return "不明"
+        }
     }
 
     /// PC からデータは来ないが、受信待ちにしておくと PC 側が閉じたことにすぐ気付ける。
@@ -845,7 +895,8 @@ final class CameraStreamer: NSObject, ObservableObject {
             memoryMB: Self.memoryFootprintMB(),
             pressure: pressureText,
             encodeInFlight: encodeStartedAt.map { now - $0 },
-            encoderResets: encoderResets
+            encoderResets: encoderResets,
+            route: routeText
         )
         let frames = totalFrames
         let bytes = totalBytes

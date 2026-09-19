@@ -6,9 +6,13 @@ Zoom や Discord のカメラ選択で「OBS Virtual Camera」を選べば Web �
     python video_receiver.py
     python video_receiver.py --virtualcam
     python video_receiver.py --virtualcam --no-preview
+
+止まったときの調査用に、同じフォルダの video_receiver.log へ経過を書き出す。
 """
 
 import argparse
+import datetime
+import os
 import socket
 import struct
 import sys
@@ -28,22 +32,47 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 FLAG_FRONT_CAMERA = 0x01
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 WINDOW_TITLE = "MicSender Camera"
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_receiver.log")
+
+# メイン処理がこの秒数以上止まったら、どこで止まっているかを書き出す。
+MAIN_STALL_SECONDS = 3
+# iPad からのデータがこの秒数以上届かなければ知らせる。
+DATA_STALL_SECONDS = 5
 
 assert HEADER_SIZE == 20, HEADER_SIZE
 
 
+class Log:
+    """ターミナルとログファイルの両方に書く。ターミナルが詰まっても先にファイルへ残す。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("video_receiver 開始 {}\n".format(datetime.datetime.now().isoformat(timespec="seconds")))
+
+    def write(self, message, echo=True):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        with self.lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                for line in message.splitlines() or [""]:
+                    f.write("{} {}\n".format(stamp, line))
+        if echo:
+            print("\n" + message, flush=True)
+
+
 class LatestFrame:
-    """受信スレッドと表示ループの間で、最新の 1 フレームだけを受け渡す。"""
+    """受信スレッドとメイン処理の間で、最新の 1 フレーム分の JPEG だけを受け渡す。"""
 
     def __init__(self):
         self.condition = threading.Condition()
-        self.frame = None
+        self.payload = None
         self.flags = 0
         self.sequence = 0
 
-    def put(self, frame, flags):
+    def put(self, payload, flags):
         with self.condition:
-            self.frame = frame
+            self.payload = payload
             self.flags = flags
             self.sequence += 1
             self.condition.notify_all()
@@ -52,7 +81,7 @@ class LatestFrame:
         with self.condition:
             if self.sequence == last_sequence:
                 self.condition.wait(timeout)
-            return self.frame, self.flags, self.sequence
+            return self.payload, self.flags, self.sequence
 
 
 class Stats:
@@ -63,33 +92,24 @@ class Stats:
         self.dropped = 0
         self.connections = 0
         self.size = None
-        # 受信処理がいま何をしているかと、最後にデータが届いた時刻。止まったときの切り分けに使う。
-        self.stage = None
+        # 最後に iPad からデータが届いた時刻。接続がなければ None。
         self.last_data_at = None
         self.handler_ident = None
 
-    def set_stage(self, stage, received_data=False):
-        with self.lock:
-            self.stage = stage
-            if received_data:
-                self.last_data_at = time.monotonic()
-
     def begin_connection(self):
         with self.lock:
-            self.stage = "ヘッダ待ち"
             self.last_data_at = time.monotonic()
             self.handler_ident = threading.get_ident()
 
     def end_connection(self):
         with self.lock:
             if self.handler_ident == threading.get_ident():
-                self.stage = None
                 self.last_data_at = None
                 self.handler_ident = None
 
-    def activity(self):
+    def on_data(self):
         with self.lock:
-            return self.stage, self.last_data_at, self.handler_ident
+            self.last_data_at = time.monotonic()
 
     def on_frame(self, nbytes, width, height):
         with self.lock:
@@ -105,12 +125,35 @@ class Stats:
         with self.lock:
             self.connections += 1
 
+    def last_data(self):
+        with self.lock:
+            return self.last_data_at
+
     def snapshot(self):
         with self.lock:
             return self.frames, self.bytes, self.dropped, self.connections, self.size
 
 
-def recv_exact(conn, size, stats, stage):
+class Heartbeat:
+    """メイン処理が今どの段階にいて、最後にいつ進んだかを記録する。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.at = time.monotonic()
+        self.stage = "開始"
+        self.ident = threading.get_ident()
+
+    def beat(self, stage):
+        with self.lock:
+            self.at = time.monotonic()
+            self.stage = stage
+
+    def read(self):
+        with self.lock:
+            return self.at, self.stage
+
+
+def recv_exact(conn, size, stats):
     buffer = bytearray(size)
     view = memoryview(buffer)
     received = 0
@@ -119,32 +162,26 @@ def recv_exact(conn, size, stats, stage):
         if n == 0:
             raise ConnectionError("closed")
         received += n
-        stats.set_stage(stage, received_data=True)
+        stats.on_data()
     return buffer
 
 
-def handle_client(conn, address, latest, stats):
-    print("\n接続: {}:{}".format(*address))
+def handle_client(conn, address, latest, stats, log):
+    # 受信スレッドは受け取るだけにし、OpenCV には触れない。
+    # OpenCV を複数のスレッドから同時に呼ぶと内部で固まることがあるため、デコードはメイン処理に任せる。
+    log.write("接続: {}:{}".format(*address))
     stats.begin_connection()
     try:
         while True:
-            stats.set_stage("ヘッダ待ち")
-            header = recv_exact(conn, HEADER_SIZE, stats, "ヘッダ待ち")
+            header = recv_exact(conn, HEADER_SIZE, stats)
             magic, version, flags, width, height, _, length, _ = struct.unpack(HEADER_FORMAT, header)
             if magic != MAGIC or version != VERSION or length > MAX_FRAME_BYTES:
-                print("\n不正なヘッダを受信したので切断します")
+                log.write("不正なヘッダを受信したので切断します")
                 break
 
-            payload = recv_exact(conn, length, stats, "JPEG 本体待ち")
-            stats.set_stage("JPEG デコード中")
-            frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is None:
-                stats.on_drop()
-                continue
-
-            stats.on_frame(length, frame.shape[1], frame.shape[0])
-            stats.set_stage("表示側へ受け渡し中")
-            latest.put(frame, flags)
+            payload = recv_exact(conn, length, stats)
+            stats.on_frame(length, width, height)
+            latest.put(bytes(payload), flags)
     except (ConnectionError, OSError):
         pass
     finally:
@@ -153,10 +190,10 @@ def handle_client(conn, address, latest, stats):
             conn.close()
         except OSError:
             pass
-        print("\n切断: {}:{}".format(*address))
+        log.write("切断: {}:{}".format(*address))
 
 
-def accept_loop(server, latest, stats, stop_event):
+def accept_loop(server, latest, stats, log, stop_event):
     current = None
     while not stop_event.is_set():
         try:
@@ -180,21 +217,46 @@ def accept_loop(server, latest, stats, stop_event):
         current = conn
         stats.on_connect()
         threading.Thread(
-            target=handle_client, args=(conn, address, latest, stats), daemon=True
+            target=handle_client, args=(conn, address, latest, stats, log), daemon=True
         ).start()
 
 
-def report_stall(stats, seconds):
-    """データが途絶えたときに、受信処理がどこで止まっているかを表示する。"""
-    stage, _, ident = stats.activity()
-    print("\n[注意] iPad から {:.0f} 秒データが届いていません。受信処理の状態: {}".format(seconds, stage))
-    if stage in ("ヘッダ待ち", "JPEG 本体待ち"):
-        print("       PC はデータを待っているだけで正常です。iPad 側が送信を止めているか、Wi-Fi が途切れています。")
-    else:
-        print("       PC 側の処理が止まっています。以下を開発者に伝えてください。")
-        frame = sys._current_frames().get(ident)
-        if frame is not None:
-            print("".join(traceback.format_stack(frame)).rstrip())
+def monitor_loop(heartbeat, stats, log, stop_event):
+    """メイン処理とは別のスレッドで、止まっている箇所がないかを 1 秒ごとに調べる。"""
+    main_stalled = False
+    data_stalled = False
+    while not stop_event.wait(1.0):
+        now = time.monotonic()
+
+        beat_at, stage = heartbeat.read()
+        if now - beat_at > MAIN_STALL_SECONDS:
+            if not main_stalled:
+                main_stalled = True
+                frame = sys._current_frames().get(heartbeat.ident)
+                stack = "".join(traceback.format_stack(frame)).rstrip() if frame is not None else "(取得できず)"
+                log.write(
+                    "[注意] PC の表示処理が {:.0f} 秒止まっています。止まっている処理: {}\n"
+                    "       iPad からの受信は続いています。この表示と {} を開発者に伝えてください。\n{}".format(
+                        now - beat_at, stage, LOG_PATH, stack
+                    )
+                )
+        elif main_stalled:
+            main_stalled = False
+            log.write("PC の表示処理が再開しました")
+
+        last_data_at = stats.last_data()
+        if last_data_at is not None and now - last_data_at > DATA_STALL_SECONDS:
+            if not data_stalled:
+                data_stalled = True
+                log.write(
+                    "[注意] iPad から {:.0f} 秒データが届いていません。\n"
+                    "       PC はデータを待っているだけです。iPad 側が送信を止めているか、Wi-Fi が途切れています。".format(
+                        now - last_data_at
+                    )
+                )
+        elif data_stalled:
+            data_stalled = False
+            log.write("iPad からのデータが再開しました")
 
 
 def fit_frame(frame, width, height):
@@ -246,9 +308,11 @@ def main():
     parser.add_argument("--fps", type=int, default=30, help="仮想カメラのフレームレート")
     args = parser.parse_args()
 
-    # 720p 程度のデコードとリサイズなら数スレッドで足りる。配信やゲームと CPU を取り合わないよう絞る。
-    cv2.setNumThreads(2)
+    # OpenCV 内部のスレッドプールを使わない。720p 程度なら 1 スレッドで十分間に合い、
+    # 複数スレッドからの呼び出しで固まる経路もなくなる。
+    cv2.setNumThreads(0)
 
+    log = Log(LOG_PATH)
     camera = open_virtual_camera(args.width, args.height, args.fps) if args.virtualcam else None
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -259,9 +323,13 @@ def main():
 
     latest = LatestFrame()
     stats = Stats()
+    heartbeat = Heartbeat()
     stop_event = threading.Event()
     threading.Thread(
-        target=accept_loop, args=(server, latest, stats, stop_event), daemon=True
+        target=accept_loop, args=(server, latest, stats, log, stop_event), daemon=True
+    ).start()
+    threading.Thread(
+        target=monitor_loop, args=(heartbeat, stats, log, stop_event), daemon=True
     ).start()
 
     print_addresses()
@@ -272,47 +340,52 @@ def main():
         print("プレビュー: なし")
     else:
         print("プレビュー: あり (ウィンドウを閉じても受信は続く。q / Esc か Ctrl+C で終了)")
+    print("ログ      : {}".format(LOG_PATH))
     print("Ctrl+C で終了")
 
     preview = not args.no_preview
-    stall_reported = False
     last_sequence = 0
     window_shown = False
     report_at = time.monotonic() + 1.0
     last_frames = 0
     last_bytes = 0
+    flags = 0
 
     try:
         while True:
-            frame, flags, sequence = latest.wait_newer(last_sequence, timeout=0.02)
-            if sequence != last_sequence and frame is not None:
+            heartbeat.beat("新しいフレーム待ち")
+            payload, flags, sequence = latest.wait_newer(last_sequence, timeout=0.02)
+            if sequence != last_sequence and payload is not None:
                 last_sequence = sequence
-                if camera is not None:
-                    camera.send(fit_frame(frame, args.width, args.height))
-                if preview:
-                    cv2.imshow(WINDOW_TITLE, frame)
-                    window_shown = True
+
+                heartbeat.beat("JPEG デコード (cv2.imdecode)")
+                frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    stats.on_drop()
+                else:
+                    if camera is not None:
+                        heartbeat.beat("仮想カメラ用の縮小 (cv2.resize)")
+                        output = fit_frame(frame, args.width, args.height)
+                        heartbeat.beat("仮想カメラへ出力 (pyvirtualcam)")
+                        camera.send(output)
+                    if preview:
+                        heartbeat.beat("プレビュー表示 (cv2.imshow)")
+                        cv2.imshow(WINDOW_TITLE, frame)
+                        window_shown = True
 
             if preview:
+                heartbeat.beat("ウィンドウ処理 (cv2.waitKey)")
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
+                heartbeat.beat("ウィンドウ状態の確認 (cv2.getWindowProperty)")
                 if window_shown and cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
                     # ここで終了すると iPad 側の接続が切れるので、プレビューだけ閉じて受信は続ける。
                     preview = False
                     cv2.destroyAllWindows()
-                    print("\nプレビューを閉じました。受信は続けます (終了は Ctrl+C)")
+                    log.write("プレビューを閉じました。受信は続けます (終了は Ctrl+C)")
 
             now = time.monotonic()
-            _, last_data_at, _ = stats.activity()
-            if last_data_at is not None and now - last_data_at > 5:
-                if not stall_reported:
-                    report_stall(stats, now - last_data_at)
-                    stall_reported = True
-            elif stall_reported:
-                print("\niPad からのデータが再開しました")
-                stall_reported = False
-
             if now >= report_at:
                 frames, total_bytes, dropped, connections, size = stats.snapshot()
                 fps = frames - last_frames
@@ -321,6 +394,7 @@ def main():
                 report_at = now + 1.0
                 size_text = "{}x{}".format(*size) if size else "-"
                 camera_text = "内" if flags & FLAG_FRONT_CAMERA else "外"
+                heartbeat.beat("状態表示の出力 (ターミナル)")
                 sys.stdout.write(
                     "\rframes={:<8} fps={:<3} size={:<10} cam={} {:>7.0f} kbps dropped={} conn={}   ".format(
                         frames, fps, size_text, camera_text if size else "-", kbps, dropped, connections

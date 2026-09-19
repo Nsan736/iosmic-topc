@@ -4,3 +4,4 @@ ios/MicSender.xcodeproj/
 ios/*.ipa
 .DS_Store
 __pycache__/
+windows/*.log

@@ -88,7 +88,10 @@ final class AudioStreamer: ObservableObject {
 
         try configureAudioSession()
 
-        let connection = NWConnection(host: NWEndpoint.Host(trimmedHost), port: nwPort, using: .udp)
+        // 映像と同じく、モバイル通信や VPN のトンネルに割り当てられて PC に届かなくなるのを防ぐ。
+        let parameters = NWParameters(dtls: nil, udp: NWProtocolUDP.Options())
+        parameters.prohibitedInterfaceTypes = [.cellular, .other]
+        let connection = NWConnection(host: NWEndpoint.Host(trimmedHost), port: nwPort, using: parameters)
         connection.stateUpdateHandler = { [weak self] newState in
             DispatchQueue.main.async {
                 guard let self = self else { return }

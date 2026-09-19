@@ -311,6 +311,11 @@ private struct CameraDiagnosticsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ValueRow(title: "接続", value: diagnostics.connection)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("経路")
+                Text(diagnostics.route)
+                    .foregroundColor(.secondary)
+            }
             ValueRow(title: "接続試行 / 切断", value: "\(diagnostics.attempts) 回 / \(diagnostics.reconnects) 回")
             ValueRow(title: "最後のカメラフレーム", value: ago(diagnostics.frameAge))
             ValueRow(title: "最後の送信完了", value: ago(diagnostics.sendAge))
